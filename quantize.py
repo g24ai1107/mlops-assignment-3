@@ -1,95 +1,59 @@
 import joblib
 import numpy as np
-import os
 import torch
+import os
 from sklearn.datasets import fetch_california_housing
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
 
-# Load dataset
-data = fetch_california_housing()
-X, y = data.data, data.target
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# Step 1: Load original model
+model = joblib.load("model.joblib")
 
-# Train original sklearn model
-model = LinearRegression()
-model.fit(X_train, y_train)
-y_pred_sklearn = model.predict(X_test)
-original_r2 = r2_score(y_test, y_pred_sklearn)
+# Step 2: Load data
+X, y = fetch_california_housing(return_X_y=True)
+y_pred = model.predict(X)
+r2_original = r2_score(y, y_pred)
 
-# Extract weights and bias
-weights = model.coef_
-bias = model.intercept_
+# Step 3: Quantize weights to float32
+weights = model.coef_.astype(np.float32)
+bias = np.array([model.intercept_], dtype=np.float32)
 
-# Save unquantized parameters
-params = {"weights": weights, "bias": bias}
-joblib.dump(params, "unquant_params.joblib")
-
-# -----------------------------
-# Quantization (Separate for weights and bias)
-# -----------------------------
-w_min, w_max = weights.min(), weights.max()
-w_scale = (w_max - w_min) / 255
-w_zero_point = np.round(-w_min / w_scale)
-
-q_weights = np.round(weights / w_scale + w_zero_point).astype(np.uint8)
-
-b_min, b_max = bias, bias
-b_scale = (b_max - b_min + 1e-6) / 255
-b_zero_point = np.round(-b_min / b_scale)
-q_bias = np.round(bias / b_scale + b_zero_point).astype(np.uint8)
-
-# Save quantized parameters
-quant_params = {
-    "weights": q_weights,
-    "bias": q_bias,
-    "w_scale": w_scale,
-    "w_zero_point": w_zero_point,
-    "b_scale": b_scale,
-    "b_zero_point": b_zero_point
-}
-joblib.dump(quant_params, "quant_params.joblib")
-
-# -----------------------------
-# Dequantization
-# -----------------------------
-dq_weights = w_scale * (q_weights.astype(np.float32) - w_zero_point)
-dq_bias = b_scale * (q_bias.astype(np.float32) - b_zero_point)
-
-# -----------------------------
-# PyTorch Model
-# -----------------------------
-class LinearModel(torch.nn.Module):
-    def __init__(self, weights, bias):
+# Step 4: Define minimal PyTorch model
+class TinyLinear(torch.nn.Module):
+    def __init__(self, in_features):
         super().__init__()
-        self.linear = torch.nn.Linear(8, 1)
-        self.linear.weight = torch.nn.Parameter(torch.tensor(weights.reshape(1, -1), dtype=torch.float32))
-        self.linear.bias = torch.nn.Parameter(torch.tensor([bias], dtype=torch.float32))
-
+        self.linear = torch.nn.Linear(in_features, 1)
+    
     def forward(self, x):
         return self.linear(x)
 
-# Inference using PyTorch model
-model = LinearModel(dq_weights, dq_bias)
+# Create model
+torch_model = TinyLinear(X.shape[1])
+
+# Set weights manually
 with torch.no_grad():
-    y_pred_torch = model(torch.tensor(X_test, dtype=torch.float32)).squeeze().numpy()
-quantized_r2 = r2_score(y_test, y_pred_torch)
+    torch_model.linear.weight = torch.nn.Parameter(torch.tensor(weights.reshape(1, -1)))
+    torch_model.linear.bias = torch.nn.Parameter(torch.tensor(bias))
 
-# -----------------------------
-# Report
-# -----------------------------
+# Step 5: Save quantized model
+quant_model_path = "quantized_model.pt"
+torch.save(torch_model.state_dict(), quant_model_path)
+
+# Step 6: Evaluate quantized model
+X_tensor = torch.tensor(X.astype(np.float32))
+y_tensor = torch.tensor(y.reshape(-1, 1).astype(np.float32))
+
+with torch.no_grad():
+    y_pred_quant = torch_model(X_tensor).numpy()
+
+r2_quant = r2_score(y, y_pred_quant)
+
+# Step 7: Compare sizes
+original_size = os.path.getsize("model.joblib") / 1024  # KB
+quant_size = os.path.getsize(quant_model_path) / 1024  # KB
+
 print("\n--- MODEL PERFORMANCE COMPARISON ---")
-print(f"Original Sklearn R² Score     : {original_r2:.4f}")
-print(f"Quantized PyTorch R² Score    : {quantized_r2:.4f}")
-
-# Get file sizes
-def get_file_size(file):
-    return os.path.getsize(file) / 1024  # KB
-
-original_size = get_file_size("unquant_params.joblib")
-quant_size = get_file_size("quant_params.joblib")
-
+print(f"Original Sklearn R² Score     : {r2_original:.4f}")
+print(f"Quantized PyTorch R² Score    : {r2_quant:.4f}")
 print(f"Original Model Size           : {original_size:.2f} KB")
 print(f"Quantized Model Size          : {quant_size:.2f} KB")
 
